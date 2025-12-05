@@ -17,7 +17,6 @@ RUN npm run build
 # Strip dev deps so node_modules is prod-only
 RUN npm prune --omit=dev
 
-
 # 2) Runtime stage: small image with prod deps only
 FROM node:20-alpine AS runtime
 
