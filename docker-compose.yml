@@ -1,0 +1,13 @@
+services:
+  zip-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zip-worker
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 4005
+    ports:
+      - "4005:4005"
+      
