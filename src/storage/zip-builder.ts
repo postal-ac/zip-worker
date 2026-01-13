@@ -251,7 +251,17 @@ export class ZipBuilder {
         const lastModified = obj.LastModified ?? new Date();
 
         const fallbackName = pathPosix.basename(s3Key);
-        const safeName = this.sanitizeFileName(f.fileName, fallbackName);
+
+        // pick the “display name”, but preserve extension if the provided name has none
+        let name = (f.fileName || "").trim() || fallbackName;
+
+        const providedExt = pathPosix.extname(name);
+        if (!providedExt) {
+          const fallbackExt = pathPosix.extname(fallbackName);
+          if (fallbackExt) name = `${name}${fallbackExt}`;
+        }
+
+        const safeName = this.sanitizeFileName(name, fallbackName);
         const entryName = this.buildEntryPath(f.relPath, safeName);
 
         console.log("[zip-builder] adding", { requestId, s3Key, entryName });
