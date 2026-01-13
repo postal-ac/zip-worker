@@ -189,6 +189,15 @@ res.on("close", () => abort.abort());   // client disconnected before response f
   res.end(JSON.stringify({ error: "Not found" }));
 }
 
+const version = () => {
+  try {
+    const pkg = require("../package.json");
+    return pkg.version || "unknown";
+  } catch {
+    return "unknown";
+  }
+};
+
 const server = createServer(handleRequest);
 server.keepAliveTimeout = 70_000;
 server.headersTimeout = 75_000;
@@ -196,4 +205,6 @@ server.requestTimeout = 0; // let your own job timeout logic control this
 
 server.listen(PORT, () => {
   console.log(`[zip-service] listening on http://localhost:${PORT}`);
+  console.log("[zip-service] max concurrent zips:", MAX_CONCURRENT_ZIPS);
+  console.log(`[zip-service] version: 1.0.1`);
 });
