@@ -5,6 +5,7 @@ import { timingSafeEqual, randomUUID } from "crypto";
 import { ZipBuilder, ZipFileDescriptor } from "./storage/zip-builder";
 
 const PORT = Number(process.env.PORT || 4005);
+const VERSION = "1.0.1";
 const API_KEY = process.env.ZIP_SERVICE_API_KEY || "";
 const MAX_BODY_BYTES = +(process.env.MAX_BODY_BYTES || 100_000_000); // 100MB
 const MAX_FILES = +(process.env.MAX_FILES || 5_000);
@@ -98,7 +99,7 @@ function readJsonBody(req: IncomingMessage): Promise<any> {
 function unauthorized(res: ServerResponse) {
   res.statusCode = 401;
   res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ error: "Unauthorized" }));
+  res.end(JSON.stringify({ error: "Unauthorized", version: VERSION }));
 }
 
 function checkApiKey(req: IncomingMessage): boolean {
@@ -206,5 +207,5 @@ server.requestTimeout = 0; // let your own job timeout logic control this
 server.listen(PORT, () => {
   console.log(`[zip-service] listening on http://localhost:${PORT}`);
   console.log("[zip-service] max concurrent zips:", MAX_CONCURRENT_ZIPS);
-  console.log(`[zip-service] version: 1.0.1`);
+  console.log(`[zip-service] version: ${VERSION}`);
 });
