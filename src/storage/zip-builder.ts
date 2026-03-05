@@ -1,10 +1,5 @@
 // zip-builder.ts
-import {
-  S3Client,
-  GetObjectCommand,
-  CopyObjectCommand,
-  DeleteObjectCommand,
-} from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import * as archiver from "archiver";
 import { PassThrough } from "stream";
@@ -15,6 +10,7 @@ import { Agent as HttpsAgent } from "https";
 
 const CONNECT_TIMEOUT_MS = +(process.env.S3_CONNECT_TIMEOUT_MS || 5_000);
 const SOCKET_TIMEOUT_MS = +(process.env.S3_SOCKET_TIMEOUT_MS || 60_000);
+const PREFETCH_CONCURRENCY = +(process.env.S3_PREFETCH_CONCURRENCY || 6);
 
 const httpHandler = new NodeHttpHandler({
   httpsAgent: new HttpsAgent({
@@ -33,12 +29,33 @@ export interface ZipFileDescriptor {
   relPath?: string;
 }
 
+export interface ZipBuildResult {
+  finalKey: string;
+  totalFiles: number;
+  addedFiles: number;
+  skippedFiles: Array<{ filePath: string; reason: string }>;
+}
+
 export interface ZipBuilderConfig {
   endpoint: string;
   region: string;
   bucket: string;
   accessKeyId: string;
   secretAccessKey: string;
+}
+
+interface PrefetchedFile {
+  kind: "ok";
+  descriptor: ZipFileDescriptor;
+  s3Key: string;
+  body: any;
+  lastModified: Date;
+}
+
+interface SkippedFile {
+  kind: "skipped";
+  filePath: string;
+  reason: string;
 }
 
 function safeStream(input: any, onErr: (e: any) => void) {
@@ -86,7 +103,6 @@ export class ZipBuilder {
         accessKeyId: cfg.accessKeyId,
         secretAccessKey: cfg.secretAccessKey,
       },
-      // (Step 2 will add retries config)
     });
   }
 
@@ -113,13 +129,55 @@ export class ZipBuilder {
     if (signal?.aborted) throw new Error("aborted");
   }
 
+  private startFetch(
+    f: ZipFileDescriptor,
+    signal?: AbortSignal,
+    requestId?: string
+  ): Promise<PrefetchedFile | SkippedFile> {
+    const s3Key = this.normalizeKey(f.filePath);
+    if (!s3Key) {
+      return Promise.resolve({
+        kind: "skipped" as const,
+        filePath: f.filePath,
+        reason: "invalid_key",
+      });
+    }
+
+    return this.s3
+      .send(
+        new GetObjectCommand({ Bucket: this.bucket, Key: s3Key }),
+        signal ? ({ abortSignal: signal } as any) : undefined
+      )
+      .then((obj) => ({
+        kind: "ok" as const,
+        descriptor: f,
+        s3Key,
+        body: obj.Body,
+        lastModified: obj.LastModified ?? new Date(),
+      }))
+      .catch((err) => {
+        if (isNoSuchKey(err)) {
+          console.warn("[zip-builder] skipping missing key", {
+            requestId,
+            s3Key,
+          });
+          return {
+            kind: "skipped" as const,
+            filePath: f.filePath,
+            reason: "missing",
+          };
+        }
+        throw err;
+      });
+  }
+
   async buildZip(opts: {
     userId: string;
     zipName: string;
     files: ZipFileDescriptor[];
-    signal?: AbortSignal; // ✅ NEW
-    requestId?: string; // optional for logs
-  }): Promise<string> {
+    signal?: AbortSignal;
+    requestId?: string;
+  }): Promise<ZipBuildResult> {
     const { userId, zipName, files, signal, requestId } = opts;
 
     this.throwIfAborted(signal);
@@ -129,17 +187,17 @@ export class ZipBuilder {
     const startedAt = Date.now();
     const safeBase = (zipName || "files.zip").replace(/[^a-zA-Z0-9_.-]/g, "_");
     const baseNoExt = safeBase.replace(/\.zip$/i, "");
-    const stamp = Date.now();
 
-    const tmpKey = `zip/${userId}/${baseNoExt}/building/${stamp}.zip`;
     const finalKey = `zip/${userId}/${baseNoExt}/current.zip`;
+    const contentDisposition = `attachment; filename="${encodeURIComponent(
+      `${baseNoExt}.zip`
+    )}"`;
 
     console.log("[zip-builder] start", {
       requestId,
       userId,
       zipName,
       fileCount: files.length,
-      tmpKey,
       finalKey,
     });
 
@@ -169,16 +227,16 @@ export class ZipBuilder {
       client: this.s3,
       params: {
         Bucket: this.bucket,
-        Key: tmpKey,
+        Key: finalKey,
         Body: body,
         ContentType: "application/zip",
+        ContentDisposition: contentDisposition,
       },
-      queueSize: +(process.env.S3_UPLOAD_QUEUE_SIZE || 4), // was 8
-      partSize: +(process.env.S3_UPLOAD_PART_SIZE || 64 * 1024 * 1024), // was 16MB
+      queueSize: +(process.env.S3_UPLOAD_QUEUE_SIZE || 8),
+      partSize: +(process.env.S3_UPLOAD_PART_SIZE || 64 * 1024 * 1024),
       leavePartsOnError: false,
     });
 
-    // ✅ Abort behavior: stop upload + streams ASAP
     const onAbort = () => {
       try {
         uploader.abort();
@@ -195,65 +253,65 @@ export class ZipBuilder {
     const uploadPromise = uploader.done();
     const pipePromise = pipeline(archive, body);
 
-    let zipBytes = 0;
-    body.on("data", (chunk) => (zipBytes += chunk.length));
-
     const beat = setInterval(() => {
       console.log("[zip-builder] heartbeat", {
         requestId,
         entries,
-        zipBytes,
+        bytesWritten,
         elapsedMs: Date.now() - startedAt,
         finalKey,
       });
-    }, 5000).unref();
+    }, 10_000).unref();
 
     const skipped: Array<{ filePath: string; reason: string }> = [];
 
     try {
-      for (const f of files) {
+      // Sliding-window prefetch: fetch next N files while archiver processes current
+      const prefetchQueue: Array<Promise<PrefetchedFile | SkippedFile>> = [];
+      let fetchIndex = 0;
+
+      // Prime the queue
+      while (
+        fetchIndex < files.length &&
+        prefetchQueue.length < PREFETCH_CONCURRENCY
+      ) {
+        prefetchQueue.push(
+          this.startFetch(files[fetchIndex++], signal, requestId)
+        );
+      }
+
+      // Consume sequentially, refilling as we go
+      while (prefetchQueue.length > 0) {
         this.throwIfAborted(signal);
 
-        const s3Key = this.normalizeKey(f.filePath);
-        if (!s3Key) {
-          skipped.push({ filePath: f.filePath, reason: "invalid_key" });
+        const result = await prefetchQueue.shift()!;
+
+        // Refill: start the next fetch
+        if (fetchIndex < files.length) {
+          prefetchQueue.push(
+            this.startFetch(files[fetchIndex++], signal, requestId)
+          );
+        }
+
+        if (result.kind === "skipped") {
+          skipped.push({ filePath: result.filePath, reason: result.reason });
           continue;
         }
 
-        let obj: any;
-        try {
-          obj = await this.s3.send(
-            new GetObjectCommand({ Bucket: this.bucket, Key: s3Key }),
-            signal ? ({ abortSignal: signal } as any) : undefined
-          );
-        } catch (err: any) {
-          if (isNoSuchKey(err)) {
-            console.warn("[zip-builder] skipping missing key", {
-              requestId,
-              s3Key,
-            });
-            skipped.push({ filePath: f.filePath, reason: "missing" });
-            continue;
-          }
-          throw err; // real error -> fail the zip
-        }
-
-        const raw = obj.Body as any;
-        const stream = safeStream(raw, (e) => {
+        const stream = safeStream(result.body, (e: any) => {
           console.warn("[zip-builder] stream error (skipping remainder)", {
             requestId,
-            s3Key,
+            s3Key: result.s3Key,
             err: e?.message ?? e,
           });
-          skipped.push({ filePath: f.filePath, reason: "stream_error" });
+          skipped.push({
+            filePath: result.descriptor.filePath,
+            reason: "stream_error",
+          });
         });
 
-        const lastModified = obj.LastModified ?? new Date();
-
-        const fallbackName = pathPosix.basename(s3Key);
-
-        // pick the “display name”, but preserve extension if the provided name has none
-        let name = (f.fileName || "").trim() || fallbackName;
+        const fallbackName = pathPosix.basename(result.s3Key);
+        let name = (result.descriptor.fileName || "").trim() || fallbackName;
 
         const providedExt = pathPosix.extname(name);
         if (!providedExt) {
@@ -262,60 +320,18 @@ export class ZipBuilder {
         }
 
         const safeName = this.sanitizeFileName(name, fallbackName);
-        const entryName = this.buildEntryPath(f.relPath, safeName);
-
-        console.log("[zip-builder] adding", { requestId, s3Key, entryName });
-
-        stream?.on?.("error", (e: any) => {
-          console.warn(
-            "[zip-builder] stream error, file will be incomplete/skipped",
-            {
-              requestId,
-              s3Key,
-              err: e?.message ?? e,
-            }
-          );
-        });
+        const entryName = this.buildEntryPath(result.descriptor.relPath, safeName);
 
         archive.append(stream, {
           name: entryName,
-          date: lastModified,
+          date: result.lastModified,
           store: true,
         });
       }
 
       archive.finalize();
 
-      const [, uploadResult] = await Promise.all([pipePromise, uploadPromise]);
-
-      console.log("[zip-builder] upload complete", {
-        requestId,
-        etag: (uploadResult as any)?.ETag,
-        tmpKey,
-      });
-
-      const copySource = `${this.bucket}/${encodeURIComponent(
-        tmpKey.replace(/^\/+/, "")
-      ).replace(/%2F/g, "/")}`;
-
-      await this.s3.send(
-        new CopyObjectCommand({
-          Bucket: this.bucket,
-          CopySource: copySource,
-          Key: finalKey,
-          ContentType: "application/zip",
-          ContentDisposition: `attachment; filename="${encodeURIComponent(
-            `${baseNoExt}.zip`
-          )}"`,
-          MetadataDirective: "REPLACE",
-        }),
-        signal ? ({ abortSignal: signal } as any) : undefined
-      );
-
-      await this.s3.send(
-        new DeleteObjectCommand({ Bucket: this.bucket, Key: tmpKey }),
-        signal ? ({ abortSignal: signal } as any) : undefined
-      );
+      await Promise.all([pipePromise, uploadPromise]);
 
       console.log("[zip-builder] done", {
         requestId,
@@ -329,11 +345,16 @@ export class ZipBuilder {
         console.warn("[zip-builder] completed with skipped files", {
           requestId,
           skippedCount: skipped.length,
-          skipped: skipped.slice(0, 20), // don’t spam
+          skipped: skipped.slice(0, 20),
         });
       }
 
-      return finalKey;
+      return {
+        finalKey,
+        totalFiles: files.length,
+        addedFiles: files.length - skipped.length,
+        skippedFiles: skipped,
+      };
     } catch (err) {
       console.error("[zip-builder] build failed", { requestId, err });
       throw err;

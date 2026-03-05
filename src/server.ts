@@ -2,16 +2,20 @@
 import "dotenv/config";
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { timingSafeEqual, randomUUID } from "crypto";
-import { ZipBuilder, ZipFileDescriptor } from "./storage/zip-builder";
+import {
+  ZipBuilder,
+  ZipFileDescriptor,
+  ZipBuildResult,
+} from "./storage/zip-builder";
 
 const PORT = Number(process.env.PORT || 4005);
-const VERSION = "1.0.1";
+const VERSION = "1.0.2";
 const API_KEY = process.env.ZIP_SERVICE_API_KEY || "";
 const MAX_BODY_BYTES = +(process.env.MAX_BODY_BYTES || 1_000_000_000); // 1GB
 const MAX_FILES = +(process.env.MAX_FILES || 5_000);
 if (!API_KEY) {
   console.warn(
-    "[zip-service] WARNING: ZIP_SERVICE_API_KEY is not set. Service will accept all requests."
+    "[zip-service] WARNING: ZIP_SERVICE_API_KEY is not set. Service will accept all requests.",
   );
 }
 
@@ -136,11 +140,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     const requestId = req.headers["x-request-id"]?.toString() || randomUUID();
     if (!req.headers["content-type"]?.includes("application/json"))
       return badRequest(res, "content_type_must_be_json");
-const abort = new AbortController();
+    const abort = new AbortController();
 
-// best signals:
-req.on("aborted", () => abort.abort()); // client aborted request
-res.on("close", () => abort.abort());   // client disconnected before response finished
+    // best signals:
+    req.on("aborted", () => abort.abort()); // client aborted request
+    res.on("close", () => abort.abort()); // client disconnected before response finished
 
     try {
       const body = (await readJsonBody(req)) as ZipRequestBody;
@@ -159,8 +163,7 @@ res.on("close", () => abort.abort());   // client disconnected before response f
         fileCount: body.files.length,
       });
 
-      // (Step 2/3 will improve how buildZip runs)
-      const finalKey = await withZipSlot(
+      const result = await withZipSlot(
         () =>
           zipBuilder.buildZip({
             userId: body.userId,
@@ -168,12 +171,21 @@ res.on("close", () => abort.abort());   // client disconnected before response f
             files: body.files,
             requestId,
             signal: abort.signal,
-          } as any),
-        abort.signal
+          }),
+        abort.signal,
       );
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify({ success: true, requestId, finalKey }));
+      res.end(
+        JSON.stringify({
+          success: true,
+          requestId,
+          finalKey: result.finalKey,
+          totalFiles: result.totalFiles,
+          addedFiles: result.addedFiles,
+          skippedFiles: result.skippedFiles,
+        }),
+      );
     } catch (err: any) {
       const msg = err?.message ?? "Internal error";
       const status = msg === "payload_too_large" ? 413 : 500;
