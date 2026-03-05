@@ -3,7 +3,7 @@ import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import * as archiver from "archiver";
 import { PassThrough } from "stream";
-import { pipeline } from "node:stream/promises";
+import { pipeline } from "stream/promises";
 import { posix as pathPosix } from "node:path";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import { Agent as HttpsAgent } from "https";
@@ -48,7 +48,7 @@ interface PrefetchedFile {
   kind: "ok";
   descriptor: ZipFileDescriptor;
   s3Key: string;
-  body: any;
+  data: Buffer;
   lastModified: Date;
 }
 
@@ -56,16 +56,6 @@ interface SkippedFile {
   kind: "skipped";
   filePath: string;
   reason: string;
-}
-
-function safeStream(input: any, onErr: (e: any) => void) {
-  const out = new PassThrough();
-  input.on("error", (e: any) => {
-    onErr(e);
-    out.end(); // finish this zip entry gracefully
-  });
-  input.pipe(out);
-  return out;
 }
 
 function isNoSuchKey(err: any) {
@@ -148,13 +138,17 @@ export class ZipBuilder {
         new GetObjectCommand({ Bucket: this.bucket, Key: s3Key }),
         signal ? ({ abortSignal: signal } as any) : undefined
       )
-      .then((obj) => ({
-        kind: "ok" as const,
-        descriptor: f,
-        s3Key,
-        body: obj.Body,
-        lastModified: obj.LastModified ?? new Date(),
-      }))
+      .then(async (obj) => {
+        // Buffer the entire file so archiver writes at memory speed
+        const bytes = await obj.Body!.transformToByteArray();
+        return {
+          kind: "ok" as const,
+          descriptor: f,
+          s3Key,
+          data: Buffer.from(bytes),
+          lastModified: obj.LastModified ?? new Date(),
+        };
+      })
       .catch((err) => {
         if (isNoSuchKey(err)) {
           console.warn("[zip-builder] skipping missing key", {
@@ -298,18 +292,6 @@ export class ZipBuilder {
           continue;
         }
 
-        const stream = safeStream(result.body, (e: any) => {
-          console.warn("[zip-builder] stream error (skipping remainder)", {
-            requestId,
-            s3Key: result.s3Key,
-            err: e?.message ?? e,
-          });
-          skipped.push({
-            filePath: result.descriptor.filePath,
-            reason: "stream_error",
-          });
-        });
-
         const fallbackName = pathPosix.basename(result.s3Key);
         let name = (result.descriptor.fileName || "").trim() || fallbackName;
 
@@ -322,7 +304,7 @@ export class ZipBuilder {
         const safeName = this.sanitizeFileName(name, fallbackName);
         const entryName = this.buildEntryPath(result.descriptor.relPath, safeName);
 
-        archive.append(stream, {
+        archive.append(result.data, {
           name: entryName,
           date: result.lastModified,
           store: true,
