@@ -11,6 +11,21 @@ import { Agent as HttpsAgent } from "https";
 const CONNECT_TIMEOUT_MS = +(process.env.S3_CONNECT_TIMEOUT_MS || 5_000);
 const SOCKET_TIMEOUT_MS = +(process.env.S3_SOCKET_TIMEOUT_MS || 60_000);
 const PREFETCH_CONCURRENCY = +(process.env.S3_PREFETCH_CONCURRENCY || 6);
+// Hard upper bound on the entire zip build operation. Without this, a slow
+// or unresponsive Wasabi GetObject can hang the worker indefinitely — Bull's
+// stall detector eventually kills it, but heartbeats stay alive in the
+// meantime so we don't notice. Default 30 minutes; tune via env.
+const MAX_ZIP_DURATION_MS = +(
+  process.env.ZIP_MAX_DURATION_MS || 30 * 60 * 1000
+);
+// Caps on fetching an extra entry (the pack licence). Deliberately tight:
+// it is a document, not media, and it must never be the reason a zip stalls.
+const EXTRA_ENTRY_TIMEOUT_MS = +(
+  process.env.ZIP_EXTRA_ENTRY_TIMEOUT_MS || 15_000
+);
+const EXTRA_ENTRY_MAX_BYTES = +(
+  process.env.ZIP_EXTRA_ENTRY_MAX_BYTES || 10 * 1024 * 1024
+);
 
 const httpHandler = new NodeHttpHandler({
   httpsAgent: new HttpsAgent({
@@ -29,11 +44,33 @@ export interface ZipFileDescriptor {
   relPath?: string;
 }
 
+/**
+ * An entry that isn't a member file — today, the pack licence. Either literal
+ * text the caller generated, or a URL to fetch.
+ *
+ * A URL rather than an S3 key on purpose: this worker only holds credentials
+ * for the zip's own bucket, and the artist's licence PDF lives in the public
+ * one. Fetching over HTTPS keeps that boundary intact.
+ */
+export interface ZipExtraEntry {
+  fileName: string;
+  text?: string;
+  url?: string;
+}
+
 export interface ZipBuildResult {
   finalKey: string;
   totalFiles: number;
   addedFiles: number;
   skippedFiles: Array<{ filePath: string; reason: string }>;
+  /**
+   * How many extra entries (today: the pack licence) actually made it in.
+   * Reported separately from the file counts because the caller compares
+   * those against the list it sent — but it still needs to know whether the
+   * licence shipped, and an absent field is how it tells a worker that
+   * predates extras from one that dropped them.
+   */
+  addedExtraEntries: number;
 }
 
 export interface ZipBuilderConfig {
@@ -165,14 +202,96 @@ export class ZipBuilder {
       });
   }
 
+  /**
+   * Resolve an extra entry to bytes. Returns null rather than throwing —
+   * a licence that can't be fetched must not cost the buyer their download.
+   */
+  private async fetchExtraEntry(
+    entry: ZipExtraEntry,
+    requestId?: string
+  ): Promise<Buffer | null> {
+    if (typeof entry.text === "string") return Buffer.from(entry.text, "utf8");
+    if (!entry.url) return null;
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), EXTRA_ENTRY_TIMEOUT_MS);
+    try {
+      const res = await fetch(entry.url, { signal: ac.signal });
+      if (!res.ok) {
+        console.warn("[zip-builder] extra entry fetch failed", {
+          requestId,
+          fileName: entry.fileName,
+          status: res.status,
+        });
+        return null;
+      }
+      const bytes = Buffer.from(await res.arrayBuffer());
+      if (bytes.byteLength > EXTRA_ENTRY_MAX_BYTES) {
+        console.warn("[zip-builder] extra entry too large, skipping", {
+          requestId,
+          fileName: entry.fileName,
+          bytes: bytes.byteLength,
+        });
+        return null;
+      }
+      return bytes;
+    } catch (err) {
+      console.warn("[zip-builder] extra entry fetch errored", {
+        requestId,
+        fileName: entry.fileName,
+        err,
+      });
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async buildZip(opts: {
     userId: string;
     zipName: string;
     files: ZipFileDescriptor[];
+    extraEntries?: ZipExtraEntry[];
     signal?: AbortSignal;
     requestId?: string;
   }): Promise<ZipBuildResult> {
-    const { userId, zipName, files, signal, requestId } = opts;
+    // Wrap the actual build in a max-duration race so a hung Wasabi
+    // GetObject (or any other indefinite stall) eventually surfaces as a
+    // clean error instead of a job that "looks alive" until Bull kills it.
+    // We compose a child AbortController so the existing onAbort cleanup
+    // path runs when the timer fires.
+    const childAc = new AbortController();
+    const onParentAbort = () => childAc.abort();
+    if (opts.signal) {
+      if (opts.signal.aborted) childAc.abort();
+      else opts.signal.addEventListener("abort", onParentAbort, { once: true });
+    }
+    const timeoutHandle = setTimeout(() => {
+      console.error("[zip-builder] hard timeout, aborting", {
+        requestId: opts.requestId,
+        zipName: opts.zipName,
+        timeoutMs: MAX_ZIP_DURATION_MS,
+      });
+      childAc.abort();
+    }, MAX_ZIP_DURATION_MS);
+    (timeoutHandle as any).unref?.();
+    try {
+      return await this.buildZipInner({ ...opts, signal: childAc.signal });
+    } finally {
+      clearTimeout(timeoutHandle);
+      if (opts.signal) opts.signal.removeEventListener("abort", onParentAbort);
+    }
+  }
+
+  private async buildZipInner(opts: {
+    userId: string;
+    zipName: string;
+    files: ZipFileDescriptor[];
+    extraEntries?: ZipExtraEntry[];
+    signal?: AbortSignal;
+    requestId?: string;
+  }): Promise<ZipBuildResult> {
+    const { userId, zipName, files, extraEntries, signal, requestId } = opts;
 
     this.throwIfAborted(signal);
 
@@ -198,10 +317,12 @@ export class ZipBuilder {
     const archive = archiver("zip", { zlib: { level: 0 }, forceZip64: true });
 
     let bytesWritten = 0;
+    let sourceFsBytes = 0;
     let entries = 0;
 
     archive.on("progress", (p) => {
-      bytesWritten = p.fs.processedBytes;
+      sourceFsBytes = p.fs.processedBytes;
+      bytesWritten = archive.pointer();
       entries = p.entries.processed;
     });
 
@@ -248,10 +369,12 @@ export class ZipBuilder {
     const pipePromise = pipeline(archive, body);
 
     const beat = setInterval(() => {
+      bytesWritten = archive.pointer();
       console.log("[zip-builder] heartbeat", {
         requestId,
         entries,
         bytesWritten,
+        sourceFsBytes,
         elapsedMs: Date.now() - startedAt,
         finalKey,
       });
@@ -311,16 +434,45 @@ export class ZipBuilder {
         });
       }
 
-      archive.finalize();
+      // Extras go in last so they sit after the member files. They are also
+      // NOT counted in addedFiles/totalFiles: the caller compares those
+      // against the file list it sent to decide whether the zip is complete
+      // (zipWorkerResultIsComplete), and a licence would skew that.
+      let addedExtraEntries = 0;
+      for (const entry of extraEntries ?? []) {
+        this.throwIfAborted(signal);
+        const data = await this.fetchExtraEntry(entry, requestId);
+        if (!data) continue;
+        archive.append(data, {
+          name: this.sanitizeFileName(entry.fileName, "LICENSE.txt"),
+          store: true,
+        });
+        addedExtraEntries += 1;
+      }
+      if ((extraEntries?.length ?? 0) > addedExtraEntries) {
+        console.warn("[zip-builder] extra entries dropped", {
+          requestId,
+          sent: extraEntries?.length ?? 0,
+          added: addedExtraEntries,
+        });
+      }
 
-      await Promise.all([pipePromise, uploadPromise]);
+      // archive.finalize() returns a promise; previously it was called
+      // without await, meaning a synchronous rejection inside finalize()
+      // could be lost between archiver and the pipeline await. Tracking
+      // it explicitly in Promise.all closes that hole.
+      const finalizePromise = archive.finalize();
 
+      await Promise.all([finalizePromise, pipePromise, uploadPromise]);
+
+      bytesWritten = archive.pointer();
       console.log("[zip-builder] done", {
         requestId,
         finalKey,
         elapsedMs: Date.now() - startedAt,
         entries,
         bytesWritten,
+        sourceFsBytes,
       });
 
       if (skipped.length) {
@@ -336,6 +488,7 @@ export class ZipBuilder {
         totalFiles: files.length,
         addedFiles: files.length - skipped.length,
         skippedFiles: skipped,
+        addedExtraEntries,
       };
     } catch (err) {
       console.error("[zip-builder] build failed", { requestId, err });

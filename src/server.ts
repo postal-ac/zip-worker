@@ -6,6 +6,7 @@ import {
   ZipBuilder,
   ZipFileDescriptor,
   ZipBuildResult,
+  ZipExtraEntry,
 } from "./storage/zip-builder";
 
 const PORT = Number(process.env.PORT || 4005);
@@ -31,7 +32,32 @@ type ZipRequestBody = {
   userId: string;
   zipName: string;
   files: ZipFileDescriptor[];
+  /** Non-member entries — today, the pack licence. See ZipExtraEntry. */
+  extraEntries?: ZipExtraEntry[];
 };
+
+// A handful at most; the field exists for licences, not for smuggling in a
+// second file list that bypasses MAX_FILES.
+const MAX_EXTRA_ENTRIES = +(process.env.MAX_EXTRA_ENTRIES || 4);
+
+/**
+ * Keep only well-formed entries. A malformed one is dropped rather than
+ * failing the request — the zip itself is what the buyer is waiting on.
+ */
+function sanitizeExtraEntries(raw: unknown): ZipExtraEntry[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(
+      (e): e is ZipExtraEntry =>
+        !!e &&
+        typeof e === "object" &&
+        typeof (e as any).fileName === "string" &&
+        !!(e as any).fileName &&
+        (typeof (e as any).text === "string" ||
+          typeof (e as any).url === "string")
+    )
+    .slice(0, MAX_EXTRA_ENTRIES);
+}
 
 const MAX_CONCURRENT_ZIPS = +(process.env.MAX_CONCURRENT_ZIPS || 2);
 
@@ -156,11 +182,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       if (body.files.length > MAX_FILES)
         return badRequest(res, "too_many_files");
 
+      const extraEntries = sanitizeExtraEntries(body.extraEntries);
+
       console.log("[zip-service] /zip request", {
         requestId,
         userId: body.userId,
         zipName: body.zipName,
         fileCount: body.files.length,
+        extraEntryCount: extraEntries.length,
       });
 
       const result = await withZipSlot(
@@ -169,6 +198,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
             userId: body.userId,
             zipName: body.zipName,
             files: body.files,
+            extraEntries,
             requestId,
             signal: abort.signal,
           }),
@@ -184,6 +214,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
           totalFiles: result.totalFiles,
           addedFiles: result.addedFiles,
           skippedFiles: result.skippedFiles,
+          // The caller records the licence in its manifest only when this
+          // confirms it shipped — absent means a worker that predates extras.
+          addedExtraEntries: result.addedExtraEntries,
         }),
       );
     } catch (err: any) {
