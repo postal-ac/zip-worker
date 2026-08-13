@@ -1,5 +1,10 @@
 // zip-builder.ts
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  GetObjectCommand,
+  PutObjectCommand,
+  HeadObjectCommand,
+} from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import * as archiver from "archiver";
 import { PassThrough } from "stream";
@@ -104,9 +109,24 @@ function isNoSuchKey(err: any) {
   );
 }
 
+export type StorageProbeResult = {
+  ok: boolean;
+  at: string;
+  roundTripMs: number | null;
+  /**
+   * Result of HEAD-ing the caller-provided canary key. The write/read probe
+   * proves the credentials work against SOME bucket; only the canary — a key
+   * the backend recently wrote — proves it is the SAME bucket the backend
+   * writes to. `null` when no canary key is configured.
+   */
+  canary: { key: string; found: boolean } | null;
+  error: string | null;
+};
+
 export class ZipBuilder {
   private s3: S3Client;
   private bucket: string;
+  private endpoint: string;
 
   constructor(cfg: ZipBuilderConfig) {
     if (!cfg.accessKeyId || !cfg.secretAccessKey) {
@@ -118,6 +138,7 @@ export class ZipBuilder {
     const MAX_ATTEMPTS = +(process.env.S3_MAX_ATTEMPTS || 4);
 
     this.bucket = cfg.bucket;
+    this.endpoint = cfg.endpoint;
     this.s3 = new S3Client({
       region: cfg.region,
       endpoint: cfg.endpoint,
@@ -131,6 +152,80 @@ export class ZipBuilder {
         secretAccessKey: cfg.secretAccessKey,
       },
     });
+  }
+
+  get bucketName() {
+    return this.bucket;
+  }
+
+  get endpointHost() {
+    try {
+      return new URL(this.endpoint).host;
+    } catch {
+      return this.endpoint;
+    }
+  }
+
+  /**
+   * Prove the configured storage actually works: write a tiny probe object,
+   * read it back, and (when given one) HEAD a canary key the backend wrote.
+   * A worker that passes write/read but fails the canary is talking to the
+   * WRONG bucket — exactly the misconfiguration that broke pack downloads.
+   */
+  async probeStorage(canaryKey?: string): Promise<StorageProbeResult> {
+    const at = new Date().toISOString();
+    const started = Date.now();
+    const probeKey = "_health/zip-worker-probe.txt";
+
+    try {
+      await this.s3.send(
+        new PutObjectCommand({
+          Bucket: this.bucket,
+          Key: probeKey,
+          Body: `probe ${at}`,
+          ContentType: "text/plain",
+        })
+      );
+      const obj = await this.s3.send(
+        new GetObjectCommand({ Bucket: this.bucket, Key: probeKey })
+      );
+      await obj.Body!.transformToByteArray();
+
+      let canary: StorageProbeResult["canary"] = null;
+      if (canaryKey) {
+        try {
+          await this.s3.send(
+            new HeadObjectCommand({
+              Bucket: this.bucket,
+              Key: this.normalizeKey(canaryKey),
+            })
+          );
+          canary = { key: canaryKey, found: true };
+        } catch (err: any) {
+          if (isNoSuchKey(err)) {
+            canary = { key: canaryKey, found: false };
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      return {
+        ok: canary ? canary.found : true,
+        at,
+        roundTripMs: Date.now() - started,
+        canary,
+        error: canary && !canary.found ? "canary_key_not_found" : null,
+      };
+    } catch (err: any) {
+      return {
+        ok: false,
+        at,
+        roundTripMs: null,
+        canary: null,
+        error: err?.message ?? String(err),
+      };
+    }
   }
 
   private normalizeKey(key: string) {
