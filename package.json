@@ -1,32 +1,31 @@
 {
   "name": "postal-zip-worker",
-  "version": "1.0.4",
-  "main": "dist/main.js",
+  "version": "1.0.5",
+  "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "start:dev": "ts-node src/server.ts"
+    "start:dev": "ts-node src/server.ts",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.940.0",
     "@aws-sdk/lib-storage": "^3.940.0",
     "archiver": "^7.0.1",
-    "bullmq": "^5.65.1",
-    "dotenv": "^17.2.3",
-    "ioredis": "^5.8.2",
-    "reflect-metadata": "^0.1.13",
-    "rxjs": "^7.8.0"
+    "dotenv": "^17.2.3"
   },
   "devDependencies": {
-    "@nestjs/cli": "^10.0.0",
-    "@nestjs/schematics": "^10.0.0",
-    "@nestjs/testing": "^10.0.0",
     "@types/archiver": "^7.0.0",
+    "@types/node": "^20.19.43",
     "ts-node": "^10.9.2",
     "typescript": "^5.4.0"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "zipworker",
+    "postal",
+    "building folders"
+  ],
+  "author": "Koen Schuite",
   "license": "ISC",
-  "description": ""
+  "description": "Postal zip worker — streams library files from R2 into downloadable pack zips"
 }

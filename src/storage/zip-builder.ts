@@ -12,32 +12,30 @@ import { pipeline } from "stream/promises";
 import { posix as pathPosix } from "node:path";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import { Agent as HttpsAgent } from "https";
+import { envInt } from "../env";
 
-const CONNECT_TIMEOUT_MS = +(process.env.S3_CONNECT_TIMEOUT_MS || 5_000);
-const SOCKET_TIMEOUT_MS = +(process.env.S3_SOCKET_TIMEOUT_MS || 60_000);
-const PREFETCH_CONCURRENCY = +(process.env.S3_PREFETCH_CONCURRENCY || 6);
+const CONNECT_TIMEOUT_MS = envInt("S3_CONNECT_TIMEOUT_MS", 5_000);
+const SOCKET_TIMEOUT_MS = envInt("S3_SOCKET_TIMEOUT_MS", 60_000);
+const PREFETCH_CONCURRENCY = envInt("S3_PREFETCH_CONCURRENCY", 6);
 // Hard upper bound on the entire zip build operation. Without this, a slow
 // or unresponsive Wasabi GetObject can hang the worker indefinitely — Bull's
 // stall detector eventually kills it, but heartbeats stay alive in the
 // meantime so we don't notice. Default 30 minutes; tune via env.
-const MAX_ZIP_DURATION_MS = +(
-  process.env.ZIP_MAX_DURATION_MS || 30 * 60 * 1000
-);
+const MAX_ZIP_DURATION_MS = envInt("ZIP_MAX_DURATION_MS", 30 * 60 * 1000);
 // Caps on fetching an extra entry (the pack licence). Deliberately tight:
 // it is a document, not media, and it must never be the reason a zip stalls.
-const EXTRA_ENTRY_TIMEOUT_MS = +(
-  process.env.ZIP_EXTRA_ENTRY_TIMEOUT_MS || 15_000
-);
-const EXTRA_ENTRY_MAX_BYTES = +(
-  process.env.ZIP_EXTRA_ENTRY_MAX_BYTES || 10 * 1024 * 1024
+const EXTRA_ENTRY_TIMEOUT_MS = envInt("ZIP_EXTRA_ENTRY_TIMEOUT_MS", 15_000);
+const EXTRA_ENTRY_MAX_BYTES = envInt(
+  "ZIP_EXTRA_ENTRY_MAX_BYTES",
+  10 * 1024 * 1024
 );
 
 const httpHandler = new NodeHttpHandler({
   httpsAgent: new HttpsAgent({
     keepAlive: true,
     keepAliveMsecs: 10_000,
-    maxSockets: +(process.env.S3_MAX_SOCKETS || 512),
-    maxFreeSockets: +(process.env.S3_MAX_FREE_SOCKETS || 128),
+    maxSockets: envInt("S3_MAX_SOCKETS", 512),
+    maxFreeSockets: envInt("S3_MAX_FREE_SOCKETS", 128),
   }),
   connectionTimeout: CONNECT_TIMEOUT_MS,
   socketTimeout: SOCKET_TIMEOUT_MS,
@@ -135,7 +133,7 @@ export class ZipBuilder {
       );
     }
 
-    const MAX_ATTEMPTS = +(process.env.S3_MAX_ATTEMPTS || 4);
+    const MAX_ATTEMPTS = envInt("S3_MAX_ATTEMPTS", 4);
 
     this.bucket = cfg.bucket;
     this.endpoint = cfg.endpoint;
@@ -240,11 +238,14 @@ export class ZipBuilder {
   }
 
   private buildEntryPath(relPath: string | undefined, fileName: string) {
-    const cleanName = fileName.replace(/^\/+/, "");
-    if (!relPath) return cleanName;
-
-    const cleanRel = relPath.replace(/^\/+/, "").replace(/\/+$/, "");
-    return `${cleanRel}/${cleanName}`;
+    // Drop empty, "." and ".." segments so no entry name can escape the
+    // buyer's extraction folder (zip-slip) — these values trace back to
+    // artist-chosen file/folder names, whatever the caller validates.
+    const joined = relPath ? `${relPath}/${fileName}` : fileName;
+    const segments = joined
+      .split(/[\\/]+/)
+      .filter((seg) => seg && seg !== "." && seg !== "..");
+    return segments.join("/") || "file";
   }
 
   private throwIfAborted(signal?: AbortSignal) {
@@ -424,10 +425,8 @@ export class ZipBuilder {
     archive.on("warning", (w) =>
       console.warn("[zip-builder] warning", { requestId, w })
     );
-    let archiveErr: any = null;
-
+    // Log only — pipeline(archive, body) already rejects the build on this.
     archive.on("error", (e) => {
-      archiveErr = e;
       console.error("[zip-builder] archiver error", { requestId, e });
     });
 
@@ -442,14 +441,16 @@ export class ZipBuilder {
         ContentType: "application/zip",
         ContentDisposition: contentDisposition,
       },
-      queueSize: +(process.env.S3_UPLOAD_QUEUE_SIZE || 8),
-      partSize: +(process.env.S3_UPLOAD_PART_SIZE || 64 * 1024 * 1024),
+      queueSize: envInt("S3_UPLOAD_QUEUE_SIZE", 8),
+      partSize: envInt("S3_UPLOAD_PART_SIZE", 64 * 1024 * 1024),
       leavePartsOnError: false,
     });
 
     const onAbort = () => {
       try {
-        uploader.abort();
+        // abort() is async — a rejection here has no awaiter, and an
+        // unhandled rejection kills the whole worker.
+        uploader.abort().catch(() => {});
       } catch {}
       try {
         archive.destroy(new Error("aborted"));
@@ -482,14 +483,23 @@ export class ZipBuilder {
       const prefetchQueue: Array<Promise<PrefetchedFile | SkippedFile>> = [];
       let fetchIndex = 0;
 
+      // When the build bails early (abort, S3 error on the awaited fetch),
+      // the queued promises are abandoned — and on abort they ALL reject
+      // moments later. The noop catch marks those rejections handled so they
+      // can't take down the process; the loop still awaits the original
+      // promise and sees the real error.
+      const queueFetch = (f: ZipFileDescriptor) => {
+        const p = this.startFetch(f, signal, requestId);
+        p.catch(() => {});
+        prefetchQueue.push(p);
+      };
+
       // Prime the queue
       while (
         fetchIndex < files.length &&
         prefetchQueue.length < PREFETCH_CONCURRENCY
       ) {
-        prefetchQueue.push(
-          this.startFetch(files[fetchIndex++], signal, requestId)
-        );
+        queueFetch(files[fetchIndex++]);
       }
 
       // Consume sequentially, refilling as we go
@@ -500,9 +510,7 @@ export class ZipBuilder {
 
         // Refill: start the next fetch
         if (fetchIndex < files.length) {
-          prefetchQueue.push(
-            this.startFetch(files[fetchIndex++], signal, requestId)
-          );
+          queueFetch(files[fetchIndex++]);
         }
 
         if (result.kind === "skipped") {
@@ -539,7 +547,10 @@ export class ZipBuilder {
         const data = await this.fetchExtraEntry(entry, requestId);
         if (!data) continue;
         archive.append(data, {
-          name: this.sanitizeFileName(entry.fileName, "LICENSE.txt"),
+          name: this.buildEntryPath(
+            undefined,
+            this.sanitizeFileName(entry.fileName, "LICENSE.txt")
+          ),
           store: true,
         });
         addedExtraEntries += 1;

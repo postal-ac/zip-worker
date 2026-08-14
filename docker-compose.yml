@@ -5,6 +5,9 @@ services:
       dockerfile: Dockerfile
     container_name: zip-worker
     restart: unless-stopped
+    # Must exceed SHUTDOWN_GRACE_MS (default 5m) plus the 10s abort-cleanup
+    # window, or Docker SIGKILLs before the drain handler finishes.
+    stop_grace_period: 5m30s
     environment:
       NODE_ENV: production
       PORT: 4005
@@ -14,14 +17,16 @@ services:
       STORAGE_ACCESS_KEY_ID: ${STORAGE_ACCESS_KEY_ID}
       STORAGE_SECRET_ACCESS_KEY: ${STORAGE_SECRET_ACCESS_KEY}
       STORAGE_REGION: ${STORAGE_REGION}
-      STORAGE_BUCKET: ${STORAGE_BUCKET}
+      # Name must match what server.ts reads (STORAGE_BUCKET_NAME) — the image
+      # carries no .env, so this mapping is the only way config reaches it.
+      STORAGE_BUCKET_NAME: ${STORAGE_BUCKET_NAME}
       STORAGE_ENDPOINT: ${STORAGE_ENDPOINT}
 
-      WASABI_REGION: ${WASABI_REGION}
-      WASABI_ENDPOINT: ${WASABI_ENDPOINT}
-      WASABI_BUCKET_NAME: ${WASABI_BUCKET_NAME}
-      WASABI_PUBLIC_BUCKET_NAME: ${WASABI_PUBLIC_BUCKET_NAME}
-      WASABI_PUBLIC_ENDPOINT: ${WASABI_PUBLIC_ENDPOINT}
+      # Optional: point at a key the backend recently wrote so /health proves
+      # this is the SAME bucket the backend uses. Empty = probe write/read only.
+      STORAGE_CANARY_KEY: ${STORAGE_CANARY_KEY:-}
+      STORAGE_PROBE_INTERVAL_MS: ${STORAGE_PROBE_INTERVAL_MS:-}
+      SHUTDOWN_GRACE_MS: ${SHUTDOWN_GRACE_MS:-}
 
     ports:
       - "4005:4005"
